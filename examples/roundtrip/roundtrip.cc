@@ -48,7 +48,8 @@ void runServer(uint16_t port)
   loop.loop();
 }
 
-TcpConnectionPtr clientConnection;
+std::map<string, TcpConnectionPtr> connections;
+//TcpConnectionPtr clientConnection;
 
 void clientConnectionCallback(const TcpConnectionPtr& conn)
 {
@@ -57,16 +58,28 @@ void clientConnectionCallback(const TcpConnectionPtr& conn)
         << (conn->connected() ? "UP" : "DOWN");
   if (conn->connected())
   {
-    clientConnection = conn;
+    //clientConnection = conn;
+    //TcpConnectionPtr tmp = conn;
+    string tname = conn->name();
+    TcpConnectionPtr tptr =  conn;
+    connections.insert(std::pair<string, TcpConnectionPtr>(conn->name(),conn));
     conn->setTcpNoDelay(true);
+    //printf("connection %s is connected \n ", conn->name();
   }
   else
   {
-    clientConnection.reset();
+    //clientConnection.reset();
+   std::map<string,TcpConnectionPtr>::iterator it;
+    it = connections.find(conn->name());
+    if (it != connections.end())
+    {  
+	it->second.reset();
+	connections.erase(it);
+    }
   }
 }
 
-void clientMessageCallback(const TcpConnectionPtr&,
+void clientMessageCallback(const TcpConnectionPtr& conn,
                            Buffer* buffer,
                            muduo::Timestamp receiveTime)
 {
@@ -79,19 +92,34 @@ void clientMessageCallback(const TcpConnectionPtr&,
     int64_t their = message[1];
     int64_t back = receiveTime.microSecondsSinceEpoch();
     int64_t mine = (back+send)/2;
+    
     LOG_INFO << "round trip " << back - send
-             << " clock error " << their - mine;
+             << " clock error " << their - mine
+	     << conn->name();
   }
 }
 
 void sendMyTime()
 {
-  if (clientConnection)
+  // show content:
+  for (std::map<string,TcpConnectionPtr>::iterator it = connections.begin(); it!=connections.end(); ++it)
+  {
+    if(it->second)
+    {
+       int64_t message[2] = { 0, 0 };
+       message[0] = Timestamp::now().microSecondsSinceEpoch();
+       it->second->send(message, sizeof message);
+    }  
+  
+  }
+
+ /* if (clientC nnection)
   {
     int64_t message[2] = { 0, 0 };
     message[0] = Timestamp::now().microSecondsSinceEpoch();
     clientConnection->send(message, sizeof message);
   }
+  */
 }
 
 void runClient(const char* ip, uint16_t port)
@@ -102,8 +130,17 @@ void runClient(const char* ip, uint16_t port)
   client.setConnectionCallback(clientConnectionCallback);
   client.setMessageCallback(clientMessageCallback);
   client.connect();
+  
+  TcpClient client1(&loop, InetAddress(ip, port), "ClockClient1");
+  client1.enableRetry();
+  client1.setConnectionCallback(clientConnectionCallback);
+  client1.setMessageCallback(clientMessageCallback);
+  client1.connect();
+
   loop.runEvery(0.2, sendMyTime);
   loop.loop();
+
+
 }
 
 int main(int argc, char* argv[])
