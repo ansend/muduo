@@ -5,15 +5,43 @@
 #include <muduo/net/SocketsOps.h>
 #include <muduo/net/TcpClient.h>
 #include <muduo/net/TcpServer.h>
+#include <boost/dynamic_bitset.hpp>
 
 #include <boost/bind.hpp>
-
 #include <stdio.h>
 
 using namespace muduo;
 using namespace muduo::net;
+using namespace boost;
 
-const size_t frameLen = 2*sizeof(int64_t);
+boost::dynamic_bitset<> reps_state (2147483647ul); 
+AtomicInt64 req_seq; // current requst packet sequence number
+AtomicInt64 res_seq; // current response packet sequence number
+
+int32_t query_cycle = 2; // send a packet every 2 milli second.
+int32_t dead_intvl = 3;  // think the packet lost if the response 
+int32_t sim_lost = 10;  //simulate the packet lost rate;
+
+const size_t frameLen = 3*sizeof(int64_t);
+
+float cal_lost_rate()
+{
+   uint64_t top = res_seq.get();
+   uint64_t lost = 0;
+   uint64_t i =0;
+   for (i = top; ((i > 0) && ((top -i) < 10000)) ; i--)
+   {
+       if(!reps_state[i])
+	   lost++; 
+   }
+   printf("%ld pakcet lost in total %ld \n", lost , top-i);
+
+   float rate = (float)lost /(float)(top-i);
+
+   printf("the lost rate is %f \n ", rate);
+
+   return rate;
+}
 
 int createNonblockingUDP()
 {
@@ -25,11 +53,12 @@ int createNonblockingUDP()
   return sockfd;
 }
 
+
 /////////////////////////////// Server ///////////////////////////////
 
 void serverReadCallback(int sockfd, muduo::Timestamp receiveTime)
 {
-  int64_t message[2];
+  int64_t message[3];
   struct sockaddr peerAddr;
   bzero(&peerAddr, sizeof peerAddr);
   socklen_t addrLen = sizeof peerAddr;
@@ -45,15 +74,18 @@ void serverReadCallback(int sockfd, muduo::Timestamp receiveTime)
   }
   else if (implicit_cast<size_t>(nr) == frameLen)
   {
-    message[1] = receiveTime.microSecondsSinceEpoch();
-    ssize_t nw = ::sendto(sockfd, message, sizeof message, 0, &peerAddr, addrLen);
-    if (nw < 0)
-    {
-      LOG_SYSERR << "::sendto";
-    }
-    else if (implicit_cast<size_t>(nw) != frameLen)
-    {
-      LOG_ERROR << "Expect " << frameLen << " bytes, wrote " << nw << " bytes.";
+    if(!(rand()%100 < sim_lost)) // simulate the packet lost
+    { 
+       message[2] = receiveTime.microSecondsSinceEpoch();
+       ssize_t nw = ::sendto(sockfd, message, sizeof message, 0, &peerAddr, addrLen);
+       if (nw < 0)
+       {
+         LOG_SYSERR << "::sendto";
+       }
+       else if (implicit_cast<size_t>(nw) != frameLen)
+       {
+         LOG_ERROR << "Expect " << frameLen << " bytes, wrote " << nw << " bytes.";
+       }
     }
   }
   else
@@ -77,7 +109,7 @@ void runServer(uint16_t port)
 
 void clientReadCallback(int sockfd, muduo::Timestamp receiveTime)
 {
-  int64_t message[2];
+  int64_t message[3];
   ssize_t nr = sockets::read(sockfd, message, sizeof message);
 
   if (nr < 0)
@@ -86,8 +118,23 @@ void clientReadCallback(int sockfd, muduo::Timestamp receiveTime)
   }
   else if (implicit_cast<size_t>(nr) == frameLen)
   {
-    int64_t send = message[0];
-    int64_t their = message[1];
+    int64_t seq = message[0];
+    printf("get the response seq num is: %ld \n", seq);
+
+    if (seq < res_seq.get()) //out of order packatet
+    {
+	    // treat it as lost
+	 printf(" think the %ld packet is lost\n", seq); 
+    }
+    else
+    {
+         reps_state[seq] = 1; //mark it as recieved
+    }
+    
+    res_seq.getAndSet(seq); // update current response index. 
+	    
+    int64_t send = message[1];
+    int64_t their = message[2];
     int64_t back = receiveTime.microSecondsSinceEpoch();
     int64_t mine = (back+send)/2;
     LOG_INFO << "round trip " << back - send
@@ -101,8 +148,9 @@ void clientReadCallback(int sockfd, muduo::Timestamp receiveTime)
 
 void sendMyTime(int sockfd)
 {
-  int64_t message[2] = { 0, 0 };
-  message[0] = Timestamp::now().microSecondsSinceEpoch();
+  int64_t message[3] = {0, 0, 0 };
+  message[0] = req_seq.addAndGet(1);
+  message[1] = Timestamp::now().microSecondsSinceEpoch();
   ssize_t nw = sockets::write(sockfd, message, sizeof message);
   if (nw < 0)
   {
@@ -128,6 +176,7 @@ void runClient(const char* ip, uint16_t port)
   channel.setReadCallback(boost::bind(&clientReadCallback, sock.fd(), _1));
   channel.enableReading();
   loop.runEvery(0.2, boost::bind(sendMyTime, sock.fd()));
+  loop.runEvery(10, boost::bind(cal_lost_rate));
   loop.loop();
 }
 
